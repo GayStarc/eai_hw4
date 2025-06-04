@@ -1,0 +1,456 @@
+Commit ID: 7e39e92e8e00b02f19d2406bd06f928a7a0ea18c
+
+
+
+On branch master
+Changes not staged for commit:
+  (use "git add/rm <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   README.md
+	modified:   src/config.py
+	modified:   src/model/est_coord.py
+	modified:   src/model/est_pose.py
+	modified:   src/utils.py
+	modified:   test.sh
+	modified:   train.py
+	deleted:    train.sh
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	eval.sh
+	train_part1.sh
+	train_part2.sh
+
+no changes added to commit (use "git add" and/or "git commit -a")
+
+
+diff --git a/README.md b/README.md
+index ca94902..d9b0af9 100644
+--- a/README.md
++++ b/README.md
+@@ -7,7 +7,7 @@ In this assignment, you are required to grasp a known object (power drill). We p
+ You can install the environment as follows:
+ 
+ ```sh
+-conda create -n hw2 python=3.10
++conda create -n hw2 python=3.10v
+ conda activate hw2
+ conda install conda-forge::roboticstoolbox-python==1.0.3
+ 
+@@ -72,3 +72,4 @@ If you install some packages that are not in the ```Environment``` part, please
+ You will get 1% bonus on the final score if you have any model with success rate >= 92.5%
+ 
+ When the point cloud is noisy, you might not be able to fit well if you simply fit using all object points due to the outliers. We can use RANSAC to solve this problem, and you will get 2% bonus on the final score if you implement RANSAC in Part II using only numpy or torch.
++
+diff --git a/src/config.py b/src/config.py
+index 1aaf852..192cad6 100644
+--- a/src/config.py
++++ b/src/config.py
+@@ -17,11 +17,11 @@ class Config:
+     """the robot we are using"""
+     obj_name: str = "power_drill"
+     """the object we want to grasp"""
+-    checkpoint: str = None
++    checkpoint: str = None # '/home/secure/Codes/lzy/eai/Assignment2/exps/est_pose_PointNet_euler_1e-3_64/checkpoint/checkpoint_10000.pth'
+     """if not None, then we will continue training from this checkpoint"""
+-    max_iter: int = 10000
++    max_iter: int = 20000
+     """the maximum number of iterations"""
+-    batch_size: int = 16
++    batch_size: int = 64
+     """the batch size for training"""
+     learning_rate: float = 1e-3
+     """maximum (and initial) learning rates"""
+diff --git a/src/model/est_coord.py b/src/model/est_coord.py
+index 0487181..77794bb 100644
+--- a/src/model/est_coord.py
++++ b/src/model/est_coord.py
+@@ -2,11 +2,13 @@ from typing import Tuple, Dict
+ import numpy as np
+ import torch
+ from torch import nn
++import torch.nn.functional as F
+ 
+ from ..config import Config
+ from ..vis import Vis
+ 
+ 
++
+ class EstCoordNet(nn.Module):
+ 
+     config: Config
+@@ -17,7 +19,24 @@ class EstCoordNet(nn.Module):
+         """
+         super().__init__()
+         self.config = config
+-        raise NotImplementedError("You need to implement some modules here")
++
++        self.mlp1 = nn.Sequential(nn.Linear(3, 64), nn.ReLU())
++        self.mlp2 = nn.Sequential(nn.Linear(64, 128), nn.ReLU())
++        self.mlp3 = nn.Sequential(nn.Linear(128, 256), nn.ReLU())
++        
++        self.global_fc = nn.Sequential(
++            nn.Linear(256, 256),
++            nn.ReLU(),
++            nn.Linear(256, 128)
++        )
++
++        self.decoder = nn.Sequential(
++            nn.Linear(64 + 128 + 128, 128),  
++            nn.ReLU(),
++            nn.Linear(128, 64),
++            nn.ReLU(),
++            nn.Linear(64, 3)
++        )
+ 
+     def forward(
+         self, pc: torch.Tensor, coord: torch.Tensor, **kwargs
+@@ -39,13 +58,107 @@ class EstCoordNet(nn.Module):
+         Dict[str, float]
+             A dictionary containing additional metrics you want to log
+         """
+-        raise NotImplementedError("You need to implement the forward function")
+-        loss = ...
+-        metric = dict(
+-            loss=loss,
+-            # additional metrics you want to log
+-        )
+-        return loss, metric
++        B, N, _ = pc.shape
++
++        x1 = self.mlp1(pc)    
++        x2 = self.mlp2(x1)   
++        x3 = self.mlp3(x2)     
++
++        x_max = torch.max(x3, dim=1, keepdim=True)[0]  
++        x_global = self.global_fc(x_max)               
++        x_global_expand = x_global.expand(-1, N, -1)  
++
++        x_cat = torch.cat([x1, x2, x_global_expand], dim=-1)  
++
++        pred_coord = self.decoder(x_cat) 
++
++        loss = F.mse_loss(pred_coord, coord)
++
++        return loss, {'loss_coord': loss.item()}
++    
++    def umeyama_alignment(self, src: torch.Tensor, tgt: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
++        """
++        src, tgt: shape (B, N, 3)
++        Returns:
++            R: (B, 3, 3)
++            t: (B, 3)
++        """
++        B, N, _ = src.shape
++
++        mu_src = src.mean(dim=1, keepdim=True) 
++        mu_tgt = tgt.mean(dim=1, keepdim=True) 
++
++        src_centered = src - mu_src  
++        tgt_centered = tgt - mu_tgt
++
++        cov = torch.matmul(tgt_centered.transpose(1, 2), src_centered) / N 
++
++        U, S, Vt = torch.linalg.svd(cov)
++
++        d = torch.det(torch.matmul(U, Vt))
++        D = torch.eye(3, device=src.device).unsqueeze(0).repeat(B, 1, 1)
++        D[:, 2, 2] = torch.where(d < 0, -1.0, 1.0)
++
++        R = torch.matmul(torch.matmul(U, D), Vt) 
++        t = mu_tgt.squeeze(1) - torch.matmul(R, mu_src.squeeze(1).unsqueeze(-1)).squeeze(-1) 
++
++        return R, t
++
++    
++    def ransac_fit(self, pc: torch.Tensor, pred_coord: torch.Tensor, max_iters=100, threshold=0.01):
++        B, N, _ = pc.shape
++        device = pc.device
++        best_R = torch.eye(3, device=device).unsqueeze(0).repeat(B, 1, 1)
++        best_t = torch.zeros(B, 3, device=device)
++        best_inlier_count = torch.zeros(B, dtype=torch.long, device=device)
++
++        for _ in range(max_iters):
++            idx = torch.randint(0, N, (B, 3), device=device)  
++            src = torch.gather(pred_coord, 1, idx.unsqueeze(-1).repeat(1, 1, 3))
++            tgt = torch.gather(pc, 1, idx.unsqueeze(-1).repeat(1, 1, 3))
++
++            R, t = self.umeyama_alignment(src, tgt)
++
++            pred_pc = (pred_coord @ R.transpose(1, 2)) + t.unsqueeze(1)
++            dist = torch.norm(pred_pc - pc, dim=-1) 
++            inlier_mask = (dist < threshold)
++            inlier_count = inlier_mask.sum(dim=-1)
++
++            update_mask = inlier_count > best_inlier_count
++            best_inlier_count = torch.where(update_mask, inlier_count, best_inlier_count)
++            best_R = torch.where(update_mask.view(-1, 1, 1), R, best_R)
++            best_t = torch.where(update_mask.view(-1, 1), t, best_t)
++
++        return best_t, best_R
++    
++    def forward_coord_only(self, pc: torch.Tensor) -> torch.Tensor:
++        """
++        Inference only: given a point cloud, predict corresponding object-frame coordinates.
++
++        Parameters
++        ----------
++        pc : torch.Tensor
++            Point cloud in camera frame, shape (B, N, 3)
++
++        Returns
++        -------
++        torch.Tensor
++            Predicted coordinates in object frame, shape (B, N, 3)
++        """
++        B, N, _ = pc.shape
++
++        x1 = self.mlp1(pc)    
++        x2 = self.mlp2(x1)  
++        x3 = self.mlp3(x2)   
++
++        x_max = torch.max(x3, dim=1, keepdim=True)[0] 
++        x_global = self.global_fc(x_max)              
++        x_global_expand = x_global.expand(-1, N, -1) 
++
++        x_cat = torch.cat([x1, x2, x_global_expand], dim=-1) 
++        pred_coord = self.decoder(x_cat)                     
++
++        return pred_coord
+ 
+     def est(self, pc: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+         """
+@@ -71,4 +184,8 @@ class EstCoordNet(nn.Module):
+ 
+         The only requirement is that the input and output should be torch tensors on the same device and with the same dtype.
+         """
+-        raise NotImplementedError("You need to implement the est function")
++        self.eval()
++        with torch.no_grad():
++            pred_coord = self.forward_coord_only(pc)  
++            trans, rot = self.ransac_fit(pc, pred_coord)
++        return trans, rot
+diff --git a/src/model/est_pose.py b/src/model/est_pose.py
+index cc55de0..1e55529 100644
+--- a/src/model/est_pose.py
++++ b/src/model/est_pose.py
+@@ -1,22 +1,56 @@
+ from typing import Tuple, Dict
+ import torch
+ from torch import nn
++import torch.nn.functional as F
+ 
+ from ..config import Config
+ 
++def rotation_6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
++    a1 = d6[..., 0:3]
++    a2 = d6[..., 3:6]
++
++    b1 = F.normalize(a1, dim=-1)
++    b2 = F.normalize(a2 - (b1 * a2).sum(-1, keepdim=True) * b1, dim=-1)
++    b3 = torch.cross(b1, b2, dim=-1)
++
++    return torch.stack((b1, b2, b3), dim=-2)
++
++def geodesic_loss(R_pred: torch.Tensor, R_gt: torch.Tensor) -> torch.Tensor:
++    # Input: Bx3x3 rotation matrices
++    R_diff = torch.matmul(R_pred.transpose(-1, -2), R_gt)
++    trace = R_diff[..., 0, 0] + R_diff[..., 1, 1] + R_diff[..., 2, 2]
++    cos_theta = (trace - 1) / 2
++    cos_theta = torch.clamp(cos_theta, -1.0 + 1e-6, 1.0 - 1e-6)
++    theta = torch.acos(cos_theta)
++    return theta.mean()
+ 
+ class EstPoseNet(nn.Module):
+ 
+     config: Config
+ 
+     def __init__(self, config: Config):
+-        """
+-        Directly estimate the translation vector and rotation matrix.
+-        """
+         super().__init__()
+         self.config = config
+-        raise NotImplementedError("You need to implement some modules here")
+-
++        self.feat = nn.Sequential( 
++            nn.Conv1d(3, 64, 1),
++            nn.BatchNorm1d(64),
++            nn.ReLU(),
++            nn.Conv1d(64, 128, 1),
++            nn.BatchNorm1d(128),
++            nn.ReLU(),
++            nn.Conv1d(128, 1024, 1),
++            nn.BatchNorm1d(1024),
++            nn.ReLU()
++        )
++        self.fc = nn.Sequential(
++            nn.Linear(1024, 512),
++            nn.ReLU(),
++            nn.Linear(512, 256),
++            nn.ReLU()
++        )
++        self.trans_head = nn.Linear(256, 3) 
++        self.rot6d_head = nn.Linear(256, 6) 
++        
+     def forward(
+         self, pc: torch.Tensor, trans: torch.Tensor, rot: torch.Tensor, **kwargs
+     ) -> Tuple[float, Dict[str, float]]:
+@@ -39,11 +73,24 @@ class EstPoseNet(nn.Module):
+         Dict[str, float]
+             A dictionary containing additional metrics you want to log
+         """
+-        raise NotImplementedError("You need to implement the forward function")
+-        loss = ...
++        pc = pc.transpose(1, 2)
++        feat = self.feat(pc)  
++        global_feat = torch.max(feat, 2)[0]  
++        x = self.fc(global_feat) 
++
++        pred_trans = self.trans_head(x)  
++        pred_rot6d = self.rot6d_head(x)  
++        pred_rot = rotation_6d_to_matrix(pred_rot6d)  
++
++        loss_trans = F.mse_loss(pred_trans, trans)
++        loss_rot = geodesic_loss(pred_rot, rot)
++
++        loss = loss_trans + loss_rot
++
+         metric = dict(
+-            loss=loss,
+-            # additional metrics you want to log
++            loss=loss.item(),
++            loss_trans=loss_trans.item(),
++            loss_rot=loss_rot.item()
+         )
+         return loss, metric
+ 
+@@ -67,4 +114,14 @@ class EstPoseNet(nn.Module):
+         ----
+         The rotation matrix should satisfy the requirement of orthogonality and determinant 1.
+         """
+-        raise NotImplementedError("You need to implement the est function")
++        pc = pc.transpose(1, 2)
++        feat = self.feat(pc)  
++        global_feat = torch.max(feat, 2)[0] 
++        x = self.fc(global_feat) 
++
++        pred_trans = self.trans_head(x)  
++        pred_rot6d = self.rot6d_head(x)  
++        pred_rot = rotation_6d_to_matrix(pred_rot6d) 
++
++        return pred_trans, pred_rot
++    
+\ No newline at end of file
+diff --git a/src/utils.py b/src/utils.py
+index c4d3bf3..944ca4e 100644
+--- a/src/utils.py
++++ b/src/utils.py
+@@ -81,7 +81,25 @@ def transform_grasp_pose(
+     Grasp
+         The transformed grasp in the robot frame.
+     """
+-    raise NotImplementedError
++    # Step 1: 物体坐标系 → 相机坐标系
++    # 平移: 先旋转再平移 (T_cam = R_obj2cam @ T_obj + t_obj2cam)
++    grasp_trans_cam = est_rot @ grasp.trans + est_trans
++    # 旋转: 直接矩阵相乘 (R_cam = R_obj2cam @ R_obj)
++    grasp_rot_cam = est_rot @ grasp.rot
++
++    # Step 2: 相机坐标系 → 机器人坐标系
++    # 平移: 先旋转再平移 (T_robot = R_cam2robot @ T_cam + t_cam2robot)
++    grasp_trans_robot = cam_rot @ grasp_trans_cam + cam_trans
++    # 旋转: 直接矩阵相乘 (R_robot = R_cam2robot @ R_cam)
++    grasp_rot_robot = cam_rot @ grasp_rot_cam
++
++    # 返回新的 Grasp 对象（夹爪宽度不变）
++    return Grasp(
++        trans=grasp_trans_robot,
++        rot=grasp_rot_robot,
++        width=grasp.width,
++    )
++
+ 
+ def get_pc(depth: np.ndarray, intrinsics: np.ndarray) -> np.ndarray:
+     """
+diff --git a/test.sh b/test.sh
+index 9e505df..9fa81fb 100644
+--- a/test.sh
++++ b/test.sh
+@@ -5,9 +5,11 @@ export WANDB_API_KEY=5bdc90c568050775a6d10650e64857fbbc76742e
+ export WANDB_USER_EMAIL=liumail2023@126.com
+ export WANDB_USERNAME=liumail2023
+ 
+-CKPT_PATH=""
++CKPT_PATH="/home/secure/Codes/lzy/eai/Assignment2/exps/est_pose_PointNet_euler_1e-3_64/checkpoint/checkpoint_17500.pth"
+ 
+ python test.py \
+     --checkpoint ${CKPT_PATH} \
+     --mode val \
+-    --device cuda:2
+\ No newline at end of file
++    --device cuda:3
++
++
+diff --git a/train.py b/train.py
+index 6f3f365..38e5f70 100644
+--- a/train.py
++++ b/train.py
+@@ -90,10 +90,12 @@ def main():
+     scheduler = CosineAnnealingLR(
+         optimizer, config.max_iter, eta_min=config.learning_rate_min
+     )
++    
++    model.to(device)
+ 
+     # load checkpoint if exists
+     if config.checkpoint is not None:
+-        checkpoint = torch.load(config.checkpoint, map_location="cpu")
++        checkpoint = torch.load(config.checkpoint, map_location=device)
+         model.load_state_dict(checkpoint["model"])
+         optimizer.load_state_dict(checkpoint["optimizer"])
+         cur_iter = checkpoint["iter"]
+@@ -104,7 +106,7 @@ def main():
+         cur_iter = 0
+ 
+     # init training
+-    model.to(device)
++    
+     model.train()
+ 
+     # start training loop here
+@@ -146,7 +148,10 @@ def main():
+                     result_dicts.append(result_dict)
+                 logger.log(
+                     {
+-                        k: np.array([dic[k].cpu() for dic in result_dicts]).mean()
++                        k: np.array([
++                            dic[k].cpu() if isinstance(dic[k], torch.Tensor) else dic[k]
++                            for dic in result_dicts
++                        ]).mean()
+                         for k in result_dicts[0].keys()
+                     },
+                     "val",
+diff --git a/train.sh b/train.sh
+deleted file mode 100644
+index 96865b9..0000000
+--- a/train.sh
++++ /dev/null
+@@ -1,14 +0,0 @@
+-
+-
+-
+-export WANDB_API_KEY=5bdc90c568050775a6d10650e64857fbbc76742e
+-export WANDB_USER_EMAIL=liumail2023@126.com
+-export WANDB_USERNAME=liumail2023
+-
+-MODEL_TYPE=est_pose # 'est_pose' 'est_coord'
+-EXP_NAME=est_pose_test
+-
+-python train.py \
+-    --model_type ${MODEL_TYPE} \
+-    --exp_name ${EXP_NAME} \
+-    --device cuda:2
+\ No newline at end of file
+
+
