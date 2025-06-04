@@ -4,16 +4,14 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from ..config import Config
-from ..vis import Vis
-
+from ..config import Pose_Est_Config
 
 
 class EstCoordNet(nn.Module):
 
-    config: Config
+    config: Pose_Est_Config
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Pose_Est_Config):
         """
         Estimate the coordinates in the object frame for each object point.
         """

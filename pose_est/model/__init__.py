@@ -3,16 +3,16 @@ import torch
 from .est_coord import EstCoordNet
 from .est_pose import EstPoseNet
 
-from ..config import Config
+from ..config import Pose_Est_Config
 
 
-def get_pose_est_model(config: Config) -> torch.nn.Module:
+def get_pose_est_model(config: Pose_Est_Config) -> torch.nn.Module:
     """
     Get model according to the model type in the config.
 
     Parameters
     ----------
-    config: Config
+    config: Pose_Est_Config
         Configuration object containing the model type.
 
     Returns

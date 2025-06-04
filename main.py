@@ -10,45 +10,41 @@ from src.sim.wrapper_env import WrapperEnvConfig, WrapperEnv
 from src.sim.wrapper_env import get_grasps
 from src.test.load_test import load_test_data
 
+from pose_est.config import Pose_Est_Config
+from pose_est.utils import get_exp_config_from_checkpoint, farthest_point_sampling
+from pose_est.model import get_pose_est_model
 import torch
 
-from hw2.src.model import get_model
-from hw2.src.config import Config
-from hw2.src.path import get_exp_config_from_checkpoint
-from hw2.src.utils import transform_grasp_pose
+def depth_to_pc(depth, intrinsics):
+    h, w = depth.shape
+    fx, fy, cx, cy = intrinsics[0, 0], intrinsics[1, 1], intrinsics[0, 2], intrinsics[1, 2]
+    u = np.arange(w)
+    v = np.arange(h)
+    u, v = np.meshgrid(u, v)
+    z = depth
+    x = (u - cx) * z / fx
+    y = (v - cy) * z / fy
+    pc = np.stack([x, y, z], axis=-1).reshape(-1, 3)
+    return pc
 
-import open3d as o3d
-
-def detect_driller_pose(img, depth, camera_matrix, camera_pose, *args, **kwargs):
+def detect_driller_pose(img, depth, camera_matrix, camera_pose, model, *args, **kwargs):
     """
     Detects the pose of driller, you can include your policy in args
     """
     # implement the detection logic here
-    # 
+    pc = depth_to_pc(depth, camera_matrix)  # (H*W, 3)
+    point_num = 1024  
+    fps_indices = farthest_point_sampling(pc, point_num)
+    pc_sampled = pc[fps_indices]
+    pc_normalized = (pc_sampled - pc_sampled.mean(0)) / pc_sampled.std(0)
+    pc_input = torch.tensor(pc_normalized, dtype=torch.float32).unsqueeze(0).to("cuda:0")  # (1, N, 3)
+    trans_pred, rot_pred = model.est(pc_input) 
+    obj_pose_in_camera = np.eye(4)
+    obj_pose_in_camera[:3, :3] = rot_pred.detach().cpu().numpy().copy()
+    obj_pose_in_camera[:3, 3] = trans_pred.detach().cpu().numpy().copy()
+    obj_pose_in_world = camera_pose @ obj_pose_in_camera
     
-    rgb_image_o3d = o3d.geometry.Image(image)
-    depth_image_o3d = o3d.geometry.Image(depth)
-    rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(
-        rgb_image_o3d, depth_image_o3d, depth_scale=1e3, depth_trunc=3.0, convert_rgb_to_intensity=False
-    )
-    camera_intrinsics = o3d.camera.PinholeCameraIntrinsic(
-        width=depth.shape[1],
-        height=depth.shape[0],
-        fx=camera_matrix[0, 0],  
-        fy=camera_matrix[0, 1],  
-        cx=camera_matrix[1, 0],  
-        cy=camera_matrix[1, 1] 
-    )
-    point_cloud = o3d.geometry.PointCloud.create_from_rgbd_image(
-        rgbd_image, camera_intrinsics
-    )
-    
-    
-    pose = np.eye(4)
-    
-    
-    
-    return pose
+    return obj_pose_in_world
 
 def detect_marker_pose(
         detector: Detector, 
@@ -148,7 +144,7 @@ def execute_plan(env: WrapperEnv, plan):
 
 TESTING = True
 DISABLE_GRASP = False
-DISABLE_MOVE = False
+DISABLE_MOVE = True
 
 def main():
     parser = argparse.ArgumentParser(description="Launcher config - Physics")
@@ -204,7 +200,7 @@ def main():
     env.step_env(humanoid_head_qpos=head_init_qpos)
     
     observing_qpos = humanoid_init_qpos + np.array([-0.2,-0.1,0.3,0,0.1,0.3,0]) # you can customize observing qpos to get wrist obs
-    observing_qpos = humanoid_init_qpos + np.array([0.1, 0, 0, 0, 0, 0, 0]) # you can customize observing qpos to get wrist obs
+    observing_qpos = humanoid_init_qpos + np.array([0.01, 0, 0, 0, 0, 0, 0]) # you can customize observing qpos to get wrist obs
     
     init_plan = plan_move_qpos(humanoid_init_qpos, observing_qpos, steps = 50)
     execute_plan(env, init_plan)
@@ -287,13 +283,25 @@ def main():
 
     print("Quadruped moved to target position.")
     # --------------------------------------step 2: detect driller pose------------------------------------------------------
+    
+    pose_est_ckpt_path = "pose_est/est_pose_PointNet_euler_geodesic_1e-3_64/checkpoint/checkpoint_20000.pth"  
+    pose_est_config = Pose_Est_Config.from_yaml(get_exp_config_from_checkpoint(pose_est_ckpt_path))
+    pose_est_model = get_pose_est_model(pose_est_config)
+    pose_est_checkpoint = torch.load(pose_est_ckpt_path, map_location="cpu")
+    pose_est_model.load_state_dict(pose_est_checkpoint["model"])
+    pose_est_model = pose_est_model.eval().to("cuda:0")
+    
     if not DISABLE_GRASP:
         obs_wrist = env.get_obs(camera_id=1) # wrist camera
         rgb, depth, camera_pose = obs_wrist.rgb, obs_wrist.depth, obs_wrist.camera_pose
         wrist_camera_matrix = env.sim.humanoid_robot_cfg.camera_cfg[1].intrinsics
-        driller_pose = detect_driller_pose(rgb, depth, wrist_camera_matrix, camera_pose)
+        driller_pose = detect_driller_pose(rgb, depth, wrist_camera_matrix, camera_pose, pose_est_model)
         # metric judgement
         Metric['obj_pose'] = env.metric_obj_pose(driller_pose)
+        
+    print(Metric['obj_pose'], "Driller pose detected:", driller_pose)
+    
+    exit()
 
 
     # --------------------------------------step 3: plan grasp and lift------------------------------------------------------

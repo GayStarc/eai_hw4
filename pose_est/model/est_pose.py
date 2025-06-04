@@ -3,7 +3,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from ..config import Config
+from ..config import Pose_Est_Config
 
 def rotation_6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
     a1 = d6[..., 0:3]
@@ -25,9 +25,9 @@ def geodesic_loss(R_pred: torch.Tensor, R_gt: torch.Tensor) -> torch.Tensor:
 
 class EstPoseNet(nn.Module):
 
-    config: Config
+    config: Pose_Est_Config
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Pose_Est_Config):
         super().__init__()
         self.config = config
         self.feat = nn.Sequential( 
