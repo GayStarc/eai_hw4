@@ -104,8 +104,43 @@ def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> 
 
     traj_reach = []
     traj_lift = []
-    succ = False
-    if not succ: return None
+
+    _, depth = env.humanoid_robot_cfg.gripper_width_to_angle_depth(grasp.width)
+    grasp_trans = grasp.trans - depth * grasp.rot[:, 0]
+    succ, grasp_arm_qpos = env.humanoid_robot_model.ik(grasp_trans, grasp.rot)
+    if not succ:
+        return None
+
+    traj_reach = [grasp_arm_qpos]
+    traj_lift = [grasp_arm_qpos]
+
+    cur_trans, cur_rot, cur_qpos = (
+        grasp_trans.copy(),
+        grasp.rot.copy(),
+        grasp_arm_qpos.copy(),
+    )
+    for _ in range(reach_steps):
+        cur_trans = cur_trans - delta_dist * cur_rot[:, 0]
+        succ, cur_qpos = env.humanoid_robot_model.ik(
+            cur_trans, cur_rot, cur_qpos, delta_thresh=0.5
+        )
+        if not succ:
+            return None
+        traj_reach = [cur_qpos] + traj_reach
+
+    cur_trans, cur_rot, cur_qpos = (
+        grasp_trans.copy(),
+        grasp.rot.copy(),
+        grasp_arm_qpos.copy(),
+    )
+    for _ in range(lift_steps):
+        cur_trans[2] += delta_dist
+        succ, cur_qpos = env.humanoid_robot_model.ik(
+            cur_trans, cur_rot, cur_qpos, delta_thresh=0.5
+        )
+        if not succ:
+            return None
+        traj_lift.append(cur_qpos)
 
     return [np.array(traj_reach), np.array(traj_lift)]
 
@@ -202,13 +237,17 @@ def main():
     observing_qpos = humanoid_init_qpos + np.array([-0.2,-0.1,0.3,0,0.1,0.3,0]) # you can customize observing qpos to get wrist obs
     # observing_qpos = humanoid_init_qpos + np.array([0, -0.1, 0, 0, 0, 0, 0]) # you can customize observing qpos to get wrist obs
     
+    
     init_plan = plan_move_qpos(humanoid_init_qpos, observing_qpos, steps = 50)
     execute_plan(env, init_plan)
     
-    obs_head = env.get_obs(camera_id=0) # head camera
-    obs_wrist = env.get_obs(camera_id=1) # wrist camera
-    env.debug_save_obs(obs_head, 'data/obs_head')
-    env.debug_save_obs(obs_wrist, 'data/obs_wrist')
+    # eef = env.humanoid_robot_model.fk_eef(observing_qpos)
+    # print(eef)
+    
+    # obs_head = env.get_obs(camera_id=0) # head camera
+    # obs_wrist = env.get_obs(camera_id=1) # wrist camera
+    # env.debug_save_obs(obs_head, 'data/obs_head')
+    # env.debug_save_obs(obs_wrist, 'data/obs_wrist')
     
     input("Press Enter to start the simulation...")
     
@@ -270,7 +309,7 @@ def main():
             
             if move_head:
                 # if you need moving head to track the marker, implement this
-                head_qpos = [0,0.6]
+                head_qpos = [0, 0.6]
                 env.step_env(
                     humanoid_head_qpos=head_qpos,
                     quad_command=quad_command
@@ -295,7 +334,8 @@ def main():
         obs_wrist = env.get_obs(camera_id=1) # wrist camera
         rgb, depth, camera_pose = obs_wrist.rgb, obs_wrist.depth, obs_wrist.camera_pose
         wrist_camera_matrix = env.sim.humanoid_robot_cfg.camera_cfg[1].intrinsics
-        driller_pose = detect_driller_pose(rgb, depth, wrist_camera_matrix, camera_pose, pose_est_model)
+        # driller_pose = detect_driller_pose(rgb, depth, wrist_camera_matrix, camera_pose, pose_est_model)
+        driller_pose = env.get_driller_pose()
         # metric judgement
         Metric['obj_pose'] = env.metric_obj_pose(driller_pose)
         
@@ -307,21 +347,36 @@ def main():
     # --------------------------------------step 3: plan grasp and lift------------------------------------------------------
     if not DISABLE_GRASP:
         obj_pose = driller_pose.copy()
+        # print(obj_pose)
         grasps = get_grasps(args.obj) 
         grasps0_n = Grasp(grasps[0].trans, grasps[0].rot @ np.diag([-1,-1,1]), grasps[0].width)
         grasps2_n = Grasp(grasps[2].trans, grasps[2].rot @ np.diag([-1,-1,1]), grasps[2].width)
-        valid_grasps = [grasps[0], grasps0_n, grasps[2], grasps2_n] # we have provided some grasps, you can choose to use them or yours
+        valid_grasps = grasps # we have provided some grasps, you can choose to use them or yours
         grasp_config = dict( 
-            reach_steps=0,
-            lift_steps=0,
-            delta_dist=0, 
+            reach_steps=50,
+            lift_steps=50,
+            delta_dist=0.002, 
         ) # the grasping design in assignment 2, you can choose to use it or design yours
 
         for obj_frame_grasp in valid_grasps:
+            trans=obj_pose[:3, :3] @ obj_frame_grasp.trans + obj_pose[:3, 3]
+            rot=obj_pose[:3, :3] @ obj_frame_grasp.rot
+            rot_x = -1 if rot[0, 1] < 0 else 1
+            rot_y = -1 if rot[1, 2] < 0 else 1
+            rot_z = -1 if rot[2, 0] < 0 else 1
+            R_in = np.array([[0, rot_x, 0], [0, 0 , rot_y], [rot_z, 0, 0]])
+            R_target = np.array([
+                [ 0, -1,  0],
+                [ 0,  0,  1],
+                [-1,  0,  0]
+            ])
+            M = R_in.T @ R_target
+            rot = rot @ M
+            
+            trans[1] += 0.005
             robot_frame_grasp = Grasp(
-                trans=obj_pose[:3, :3] @ obj_frame_grasp.trans
-                + obj_pose[:3, 3],
-                rot=obj_pose[:3, :3] @ obj_frame_grasp.rot,
+                trans=trans,
+                rot=rot,
                 width=obj_frame_grasp.width,
             )
             grasp_plan = plan_grasp(env, robot_frame_grasp, grasp_config)
@@ -332,8 +387,9 @@ def main():
             env.close()
             return
         reach_plan, lift_plan = grasp_plan
+        
 
-        pregrasp_plan = plan_move_qpos(env, observing_qpos, reach_plan[0], steps=50) # pregrasp, change if you want
+        pregrasp_plan = plan_move_qpos(observing_qpos, reach_plan[0], steps=200) # pregrasp, change if you want
         execute_plan(env, pregrasp_plan)
         open_gripper(env)
         execute_plan(env, reach_plan)

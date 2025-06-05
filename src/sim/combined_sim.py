@@ -264,8 +264,8 @@ class CombinedSim:
             seg=dict(segmentation=True),
         )
         if camera_pose is not None:
-            if camera_id == 0:
-                print(camera_pose)
+            # if camera_id == 0:
+            #     print(camera_pose)
             trans = camera_pose[:3, 3].copy()
             self.mj_data.mocap_pos[self.camera_mocap_ids[camera_id]] = trans
             quat = mat2quat(camera_pose[:3, :3].dot(np.diag([1,-1,-1])))
