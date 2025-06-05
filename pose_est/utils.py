@@ -54,3 +54,42 @@ def farthest_point_sampling(points: np.ndarray, num_samples: int) -> np.ndarray:
         sampled_indices[i] = np.argmax(distances)
     
     return sampled_indices
+
+def get_pc(depth: np.ndarray, intrinsics: np.ndarray) -> np.ndarray:
+    """
+    Convert depth image into point cloud using intrinsics
+
+    All points with depth=0 are filtered out
+
+    Parameters
+    ----------
+    depth: np.ndarray
+        Depth image, shape (H, W)
+    intrinsics: np.ndarray
+        Intrinsics matrix with shape (3, 3)
+
+    Returns
+    -------
+    np.ndarray
+        Point cloud with shape (N, 3)
+    """
+    # Get image dimensions
+    height, width = depth.shape
+    # Create meshgrid for pixel coordinates
+    v, u = np.meshgrid(range(height), range(width), indexing="ij")
+    # Flatten the arrays
+    u = u.flatten()
+    v = v.flatten()
+    depth_flat = depth.flatten()
+    # Filter out invalid depth values
+    valid = depth_flat > 0
+    u = u[valid]
+    v = v[valid]
+    depth_flat = depth_flat[valid]
+    # Create homogeneous pixel coordinates
+    pixels = np.stack([u, v, np.ones_like(u)], axis=0)
+    # Convert pixel coordinates to camera coordinates
+    rays = np.linalg.inv(intrinsics) @ pixels
+    # Scale rays by depth
+    points = rays * depth_flat
+    return points.T

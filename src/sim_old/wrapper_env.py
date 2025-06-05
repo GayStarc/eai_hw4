@@ -144,13 +144,13 @@ class WrapperEnv:
             raise NotImplementedError
         
         cam_pose = to_pose(cam_trans, cam_rot)
-        # render_cfg = MjRenderConfig.from_intrinsics_extrinsics(
-        #     self.humanoid_robot_cfg.camera_cfg[camera_id].height,
-        #     self.humanoid_robot_cfg.camera_cfg[camera_id].width,
-        #     self.humanoid_robot_cfg.camera_cfg[camera_id].intrinsics,
-        #     cam_pose.copy(),
-        # )
-        x = self.sim.render(camera_id=camera_id, camera_pose=cam_pose)
+        render_cfg = MjRenderConfig.from_intrinsics_extrinsics(
+            self.humanoid_robot_cfg.camera_cfg[camera_id].height,
+            self.humanoid_robot_cfg.camera_cfg[camera_id].width,
+            self.humanoid_robot_cfg.camera_cfg[camera_id].intrinsics,
+            cam_pose.copy(),
+        )
+        x = self.sim.render(render_cfg)
 
         obs = Obs(
             rgb=x["rgb"],
@@ -268,7 +268,8 @@ class WrapperEnv:
         dist_diff = np.linalg.norm(driller_pose[:3, 3] - obj_pose[:3, 3])
         rot_diff = driller_pose[:3, :3] @ obj_pose[:3, :3].T
         angle_diff = np.abs(np.arccos(np.clip((np.trace(rot_diff) - 1) / 2, -1, 1)))
-        # print("dist_diff:", dist_diff, "angle_diff:", angle_diff)
+        print(f"dist_diff: {dist_diff}, angle_diff: {angle_diff}")
+        print(f"driller_pose: {driller_pose}\nobj_pose: {obj_pose}")        
         if dist_diff < 0.025 and angle_diff < 0.25:
             return True
         return False

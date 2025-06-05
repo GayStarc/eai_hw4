@@ -11,7 +11,7 @@ from src.sim.wrapper_env import get_grasps
 from src.test.load_test import load_test_data
 
 from pose_est.config import Pose_Est_Config
-from pose_est.utils import get_exp_config_from_checkpoint, farthest_point_sampling
+from pose_est.utils import get_exp_config_from_checkpoint, farthest_point_sampling, get_pc
 from pose_est.model import get_pose_est_model
 import torch
 
@@ -32,12 +32,12 @@ def detect_driller_pose(img, depth, camera_matrix, camera_pose, model, *args, **
     Detects the pose of driller, you can include your policy in args
     """
     # implement the detection logic here
-    pc = depth_to_pc(depth, camera_matrix)  # (H*W, 3)
+    pc = get_pc(depth, camera_matrix) * np.array([-1, -1, 1])
     point_num = 1024  
     fps_indices = farthest_point_sampling(pc, point_num)
     pc_sampled = pc[fps_indices]
     pc_normalized = (pc_sampled - pc_sampled.mean(0)) / pc_sampled.std(0)
-    pc_input = torch.tensor(pc_normalized, dtype=torch.float32).unsqueeze(0).to("cuda:0")  # (1, N, 3)
+    pc_input = torch.tensor(pc_sampled, dtype=torch.float32).unsqueeze(0).to("cuda:0")  # (1, N, 3)
     trans_pred, rot_pred = model.est(pc_input) 
     obj_pose_in_camera = np.eye(4)
     obj_pose_in_camera[:3, :3] = rot_pred.detach().cpu().numpy().copy()
@@ -200,7 +200,7 @@ def main():
     env.step_env(humanoid_head_qpos=head_init_qpos)
     
     observing_qpos = humanoid_init_qpos + np.array([-0.2,-0.1,0.3,0,0.1,0.3,0]) # you can customize observing qpos to get wrist obs
-    observing_qpos = humanoid_init_qpos + np.array([0.01, 0, 0, 0, 0, 0, 0]) # you can customize observing qpos to get wrist obs
+    # observing_qpos = humanoid_init_qpos + np.array([0, -0.1, 0, 0, 0, 0, 0]) # you can customize observing qpos to get wrist obs
     
     init_plan = plan_move_qpos(humanoid_init_qpos, observing_qpos, steps = 50)
     execute_plan(env, init_plan)
@@ -299,9 +299,9 @@ def main():
         # metric judgement
         Metric['obj_pose'] = env.metric_obj_pose(driller_pose)
         
-    print(Metric['obj_pose'], "Driller pose detected:", driller_pose)
+    # print(Metric['obj_pose'], "Driller pose detected:", driller_pose)
     
-    exit()
+    # exit()
 
 
     # --------------------------------------step 3: plan grasp and lift------------------------------------------------------
