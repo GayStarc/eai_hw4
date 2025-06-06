@@ -144,14 +144,28 @@ def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> 
 
     return [np.array(traj_reach), np.array(traj_lift)]
 
-def plan_move(env: WrapperEnv, begin_qpos, begin_trans, begin_rot, end_trans, end_rot, steps = 50, *args, **kwargs):
-    """Plan a trajectory moving the driller from table to dropping position"""
-    # implement
+def plan_move(env, begin_qpos, begin_trans, begin_rot, end_trans, end_rot, steps=100, *args, **kwargs):
     traj = []
+    cur_qpos = begin_qpos.copy()
 
-    succ = False
-    if not succ: return None
-    return traj
+    cur_trans = begin_trans.copy()
+    cur_rot = begin_rot.copy()
+
+    delta_trans = (end_trans - begin_trans) / steps
+
+    print(delta_trans)
+
+    for _ in range(steps):
+        cur_trans = cur_trans + delta_trans
+        succ, cur_qpos = env.humanoid_robot_model.ik(
+            cur_trans, cur_rot, cur_qpos, delta_thresh=1
+        )
+        if not succ:
+            return None
+        traj.append(cur_qpos.copy())
+
+    return np.array(traj)
+
 
 def open_gripper(env: WrapperEnv, steps = 10):
     for _ in range(steps):
@@ -179,7 +193,7 @@ def execute_plan(env: WrapperEnv, plan):
 
 TESTING = True
 DISABLE_GRASP = False
-DISABLE_MOVE = True
+DISABLE_MOVE = False
 
 def main():
     parser = argparse.ArgumentParser(description="Launcher config - Physics")
@@ -244,8 +258,8 @@ def main():
     # eef = env.humanoid_robot_model.fk_eef(observing_qpos)
     # print(eef)
     
-    # obs_head = env.get_obs(camera_id=0) # head camera
-    # obs_wrist = env.get_obs(camera_id=1) # wrist camera
+    obs_head = env.get_obs(camera_id=0) # head camera
+    obs_wrist = env.get_obs(camera_id=1) # wrist camera
     # env.debug_save_obs(obs_head, 'data/obs_head')
     # env.debug_save_obs(obs_wrist, 'data/obs_wrist')
     
@@ -401,10 +415,38 @@ def main():
     if not DISABLE_GRASP and not DISABLE_MOVE:
         # implement your moving plan
         #
-        move_plan = plan_move(
-            env=env,
-        ) 
-        execute_plan(env, move_plan)
+        final_lift_qpos = lift_plan[-1]
+
+        begin_qpos = final_lift_qpos
+        begin_trans, begin_rot = env.humanoid_robot_model.fk_eef(begin_qpos)
+
+        end_trans = pose_container_world[:3, 3].copy()
+        end_trans[2] += 0.2  # 抬高避免碰撞
+        end_trans[0] += 0.45  
+        end_trans[1] += 0.1  # 偏移一点，避免碰撞
+        end_rot = begin_rot.copy()
+
+        # 高点
+        middle_trans = end_trans.copy()
+        middle_trans[2] += 0.3  # 抬高 15cm
+        middle_rot = end_rot  # 姿态不变
+
+        # 第一段：从抓完处 → 高点
+        plan1 = plan_move(env, begin_qpos, begin_trans, begin_rot, middle_trans, middle_rot, steps=50)
+        if plan1 is None:
+            print("Plan to middle failed")
+            return
+        
+        execute_plan(env, plan1)
+
+        # 第二段：从高点 → container 上方
+        qpos_middle = plan1[-1]
+        plan2 = plan_move(env, qpos_middle, middle_trans, middle_rot, end_trans, end_rot, steps=50)
+        if plan2 is None:
+            print("Plan to container failed")
+            return
+        
+        execute_plan(env, plan2)
         open_gripper(env)
 
 
