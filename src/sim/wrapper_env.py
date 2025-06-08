@@ -268,7 +268,7 @@ class WrapperEnv:
         dist_diff = np.linalg.norm(driller_pose[:3, 3] - obj_pose[:3, 3])
         rot_diff = driller_pose[:3, :3] @ obj_pose[:3, :3].T
         angle_diff = np.abs(np.arccos(np.clip((np.trace(rot_diff) - 1) / 2, -1, 1)))
-        # print("dist_diff:", dist_diff, "angle_diff:", angle_diff)
+        print("dist_diff:", dist_diff, "angle_diff:", angle_diff)
         if dist_diff < 0.025 and angle_diff < 0.25:
             return True
         return False

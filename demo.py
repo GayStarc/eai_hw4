@@ -81,6 +81,7 @@ def demo_sim():
     obs_wrist = env.get_obs(camera_id=1) # wrist camera
     env.debug_save_obs(obs_head, 'data/obs_head') # obs has rgb, depth, and camera pose
     env.debug_save_obs(obs_wrist, 'data/obs_wrist')
+    print(env.sim.humanoid_robot_cfg.camera_cfg[1].intrinsics)
 
     trans, rot = env.humanoid_robot_model.fk_link(humanoid_init_qpos, env.humanoid_robot_cfg.link_eef)
     succ, qpos = env.humanoid_robot_model.ik(trans=trans, rot=rot)

@@ -13,38 +13,155 @@ from src.test.load_test import load_test_data
 from pose_est.config import Pose_Est_Config
 from pose_est.utils import get_exp_config_from_checkpoint, farthest_point_sampling, get_pc
 from pose_est.model import get_pose_est_model
-import torch
+import torch, time
 
-def depth_to_pc(depth, intrinsics):
-    h, w = depth.shape
-    fx, fy, cx, cy = intrinsics[0, 0], intrinsics[1, 1], intrinsics[0, 2], intrinsics[1, 2]
-    u = np.arange(w)
-    v = np.arange(h)
-    u, v = np.meshgrid(u, v)
-    z = depth
-    x = (u - cx) * z / fx
-    y = (v - cy) * z / fy
-    pc = np.stack([x, y, z], axis=-1).reshape(-1, 3)
-    return pc
+DEPTH_IMG_SCALE = 16384
+
+TABLE_HEIGHT = 0.66
+OBJ_INIT_TRANS = np.array([0.51, 0.365, 0.82])
+OBJ_RAND_RANGE = 0.14
+
+PC_MIN = np.array(
+    [
+        OBJ_INIT_TRANS[0] - OBJ_RAND_RANGE / 2,
+        OBJ_INIT_TRANS[1] - OBJ_RAND_RANGE /2,
+        0.69,
+    ]
+)
+PC_MAX = np.array(
+    [
+        OBJ_INIT_TRANS[0] + OBJ_RAND_RANGE / 2,
+        OBJ_INIT_TRANS[1] + OBJ_RAND_RANGE /2,
+        0.895,
+    ]
+)
+
+def transform_obj_pose_to_world(
+    obj_trans_cam: np.ndarray,  # 物体在相机坐标系的平移 [3,]
+    obj_rot_cam: np.ndarray,    # 物体在相机坐标系的旋转 [3, 3]
+    cam_trans_world: np.ndarray, # 相机在世界坐标系的平移 [3,]
+    cam_rot_world: np.ndarray    # 相机在世界坐标系的旋转 [3, 3]
+) -> np.ndarray:
+    """
+    将物体位姿从相机坐标系转换到世界坐标系。
+
+    参数:
+        obj_trans_cam: 物体在相机坐标系的平移向量。
+        obj_rot_cam: 物体在相机坐标系的旋转矩阵。
+        cam_trans_world: 相机在世界坐标系的平移向量。
+        cam_rot_world: 相机在世界坐标系的旋转矩阵。
+
+    返回:
+        obj_pose_world: 物体在世界坐标系的4x4位姿矩阵。
+    """
+    # 1. 物体坐标系 → 相机坐标系（如果obj_rot/trans已经是相机坐标系下的，可跳过）
+    # （此处假设obj_rot_cam和obj_trans_cam已经是相机坐标系下的值，无需额外变换）
+
+    # 2. 相机坐标系 → 世界坐标系
+    obj_trans_world = cam_rot_world @ obj_trans_cam + cam_trans_world
+    obj_rot_world = cam_rot_world @ obj_rot_cam
+
+    # 组合为4x4位姿矩阵
+    obj_pose_world = np.eye(4)
+    obj_pose_world[:3, :3] = obj_rot_world
+    obj_pose_world[:3, 3] = obj_trans_world
+    obj_pose_world[2,3]-=0.04  # 调整Z轴位置，确保物体在桌面上方
+
+    return obj_pose_world
+
+import open3d as o3d
+def visualize_point_cloud(points, title="Point Cloud"):
+    """
+    可视化点云（兼容所有Open3D版本）
+    """
+    # 转换为numpy数组
+    if hasattr(points, 'cpu'):
+        points = points.cpu().numpy()
+    if points.ndim == 3:
+        points = points.squeeze(0)
+    
+    # 计算并打印坐标信息
+    min_pt = np.min(points, axis=0)
+    max_pt = np.max(points, axis=0)
+    print(f"\n{title} 坐标范围:")
+    print(f"X: {min_pt[0]:.2f} → {max_pt[0]:.2f}")
+    print(f"Y: {min_pt[1]:.2f} → {max_pt[1]:.2f}")
+    print(f"Z: {min_pt[2]:.2f} → {max_pt[2]:.2f}")
+    
+    # 创建点云对象
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    pcd.paint_uniform_color([0, 0, 1])
+    
+    # 创建坐标系（自适应大小）
+    coord_size = np.ptp(points, axis=0).max()/5
+    coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+        size=coord_size,
+        origin=[0, 0, 0]
+    )
+    
+    # 可视化
+    o3d.visualization.draw_geometries([pcd, coord_frame], window_name=title)
+
+def get_workspace_mask(pc: np.ndarray, z: float) -> np.ndarray:
+    """Get the mask of the point cloud in the workspace."""
+    z_min = z
+    z_max = z + 0.1
+    pc_mask = (
+        (pc[:, 0] > PC_MIN[0])
+        & (pc[:, 0] < PC_MAX[0])
+        & (pc[:, 1] > PC_MIN[1])
+        & (pc[:, 1] < PC_MAX[1])
+        & (pc[:, 2] > z_min)
+        & (pc[:, 2] < z_max)
+    )
+    return pc_mask
 
 def detect_driller_pose(img, depth, camera_matrix, camera_pose, model, *args, **kwargs):
     """
     Detects the pose of driller, you can include your policy in args
     """
     # implement the detection logic here
-    pc = get_pc(depth, camera_matrix) * np.array([-1, -1, 1])
-    point_num = 1024  
-    fps_indices = farthest_point_sampling(pc, point_num)
-    pc_sampled = pc[fps_indices]
-    pc_normalized = (pc_sampled - pc_sampled.mean(0)) / pc_sampled.std(0)
-    pc_input = torch.tensor(pc_sampled, dtype=torch.float32).unsqueeze(0).to("cuda:0")  # (1, N, 3)
-    trans_pred, rot_pred = model.est(pc_input) 
-    obj_pose_in_camera = np.eye(4)
-    obj_pose_in_camera[:3, :3] = rot_pred.detach().cpu().numpy().copy()
-    obj_pose_in_camera[:3, 3] = trans_pred.detach().cpu().numpy().copy()
-    obj_pose_in_world = camera_pose @ obj_pose_in_camera
+
+    full_pc_camera = get_pc(depth, camera_matrix) * np.array([-1, -1, 1])
+    print(depth[170][520])
     
-    return obj_pose_in_world
+    full_pc_world = (
+                np.einsum("ab,nb->na", camera_pose[:3, :3], full_pc_camera)
+                + camera_pose[:3, 3]
+            )
+
+    point_num = 1024  
+    pc_mask = get_workspace_mask(full_pc_world, 0.6)
+    # for z in range(75, 68, -1):
+    #     height = z / 100
+    #     pc_mask = get_workspace_mask(full_pc_world, height)
+    #     if np.sum(pc_mask) > point_num:
+    #         print(f"Height {height} has enough points: {np.sum(pc_mask)}")
+    #         break
+    sel_pc_idx = np.random.randint(0, np.sum(pc_mask), point_num)
+    pc_camera = torch.tensor(full_pc_camera[pc_mask][sel_pc_idx], dtype=torch.float32).unsqueeze(0).to("cuda:0")  # (1, N, 3)
+    
+    visualize_point_cloud(pc_camera, "Sampled Point Cloud (World Frame) - After Masking")    
+    trans_pred, rot_pred = model.est(pc_camera) 
+    
+    obj_pose = np.eye(4)
+    obj_pose[:3, :3] = rot_pred.detach().cpu().numpy().copy()
+    obj_pose[:3, 3] = trans_pred.detach().cpu().numpy().copy()
+    
+    # 提取相机在世界坐标系的位姿
+    cam_rot_world = camera_pose[:3, :3]  # [3, 3]
+    cam_trans_world = camera_pose[:3, 3] # [3,]
+
+    # 转换到世界坐标系
+    obj_pose_world = transform_obj_pose_to_world(
+        obj_trans_cam=obj_pose[:3, 3],
+        obj_rot_cam=obj_pose[:3, :3],
+        cam_trans_world=cam_trans_world,
+        cam_rot_world=cam_rot_world
+    )
+    
+    return obj_pose_world
 
 def detect_marker_pose(
         detector: Detector, 
@@ -73,27 +190,51 @@ def detect_marker_pose(
     
     return trans_marker_world, rot_marker_world
 
-def forward_quad_policy(pose, target_pose, *args, **kwargs):
+def get_yaw_from_pose(pose):
+    """从4x4的齐次矩阵中提取yaw角（绕Z轴旋转）"""
+    # 取旋转矩阵部分
+    rot_mat = pose[:3, :3]
+    yaw = np.arctan2(rot_mat[1, 0], rot_mat[0, 0])
+    return yaw
+
+def forward_quad_policy(pose, target_pose, target_yaw, *args, **kwargs):
     """ guide the quadruped to position where you drop the driller """
     # implement
     pos = pose[:3, 3]
     target = target_pose[:3, 3]
-    delta = pos - target
+    delta = target - pos
     direction = delta[:2]
-    action_xy = np.clip(direction, -0.1, 0.1)
-    action_yaw = 0 
-    return np.array([action_xy[0], action_xy[1], action_yaw])
+    action_xy = np.clip(direction, -0.2, 0.2)
 
-def backward_quad_policy(pose, target_pose, *args, **kwargs):
+    current_yaw = get_yaw_from_pose(pose)
+    delta_yaw =  target_yaw - current_yaw  
+    action_yaw = np.clip(delta_yaw, -0.4, 0.4) if abs(delta_yaw) > 0.05 else 0.0
+
+    if current_yaw < 0:
+        action_xy *= -1
+
+    return np.array([action_xy[0], action_xy[1], action_yaw]) if (current_yaw < -0.25 * target_yaw or current_yaw > 0.9 * target_yaw) else np.array([0, 0, action_yaw])
+
+def backward_quad_policy(pose, target_pose, target_yaw, *args, **kwargs):
     """ guide the quadruped back to its initial position """
     # implement
     pos = pose[:3, 3]
     target = target_pose[:3, 3]
-    delta = pos - target
+    delta = target - pos
     direction = delta[:2]
-    action_xy = np.clip(direction, -0.2, 0.1)
-    action_yaw = 0 
-    return np.array([action_xy[0], action_xy[1], action_yaw])
+    action_xy = np.clip(direction, -0.2, 0.2)
+
+    current_yaw = get_yaw_from_pose(pose)
+    delta_yaw =  target_yaw - current_yaw  
+    # print(f"Current Yaw: {current_yaw}, Target Yaw: {target_yaw}, Delta Yaw: {delta_yaw}")
+    action_yaw = np.clip(delta_yaw, -0.4, 0.4) if abs(delta_yaw) > 0.05 else 0.0
+    if current_yaw < 0:
+        action_xy *= -1
+        
+    if pos[0] < 0.85 and current_yaw > -0.25 * target_yaw:    
+        return np.array([action_xy[0], action_xy[1], 0])
+
+    return np.array([action_xy[0], action_xy[1], action_yaw]) if (current_yaw < 0.9 * target_yaw) else np.array([0, 0, action_yaw])
 
 def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> Optional[List[np.ndarray]]:
     """Try to plan a grasp trajectory for the given grasp. The trajectory is a list of joint positions. Return None if the trajectory is not valid."""
@@ -152,9 +293,6 @@ def plan_move(env, begin_qpos, begin_trans, begin_rot, end_trans, end_rot, steps
     cur_rot = begin_rot.copy()
 
     delta_trans = (end_trans - begin_trans) / steps
-
-    print(delta_trans)
-
     for _ in range(steps):
         cur_trans = cur_trans + delta_trans
         succ, cur_qpos = env.humanoid_robot_model.ik(
@@ -193,7 +331,7 @@ def execute_plan(env: WrapperEnv, plan):
 
 TESTING = True
 DISABLE_GRASP = False
-DISABLE_MOVE = False
+DISABLE_MOVE = True
 
 def main():
     parser = argparse.ArgumentParser(description="Launcher config - Physics")
@@ -260,14 +398,16 @@ def main():
     
     obs_head = env.get_obs(camera_id=0) # head camera
     obs_wrist = env.get_obs(camera_id=1) # wrist camera
-    # env.debug_save_obs(obs_head, 'data/obs_head')
-    # env.debug_save_obs(obs_wrist, 'data/obs_wrist')
+    env.debug_save_obs(obs_head, 'data/obs_head')
+    env.debug_save_obs(obs_wrist, 'data/obs_wrist')
     
+    print(env.get_driller_pose())
+        
     input("Press Enter to start the simulation...")
     
     # --------------------------------------step 1: move quadruped to dropping position--------------------------------------
     if not DISABLE_MOVE:
-        forward_steps = 1000 # number of steps that quadruped walk to dropping position
+        forward_steps = 10000 # number of steps that quadruped walk to dropping position
         steps_per_camera_shot = 2 # number of steps per camera shot, increase this to reduce the frequency of camera shots and speed up the simulation
         head_camera_matrix = env.sim.humanoid_robot_cfg.camera_cfg[0].intrinsics
         head_camera_params = (head_camera_matrix[0, 0],head_camera_matrix[1, 1],head_camera_matrix[0, 2],head_camera_matrix[1, 2])
@@ -275,7 +415,8 @@ def main():
         # implement this to guide the quadruped to target dropping position
         #
         target_container_pose = obs_head.camera_pose
-        target_container_pose[0, 3] += 0.05
+        target_container_pose[0, 3] += 0.5
+        target_container_pose[1, 3] += 0.08
                 
         def is_close(pose1, pose2, threshold): 
             R1, t1 = pose1[:3, :3], pose1[:3, 3]
@@ -305,13 +446,18 @@ def main():
                     trans_container_world = rot_marker_world @ np.array([0,0.31,0.02]) + trans_marker_world
                     rot_container_world = rot_marker_world
                     pose_container_world = to_pose(trans_container_world, rot_container_world)
+                    pose_container_world[0, 3] -= 0.6 if get_yaw_from_pose(pose_container_world) > 0 else 0
                 
-                    # print("Container pose:", pose_container_world)
+                    # print("Target container pose:", target_container_pose[:3, 3])
+                    # print("Detected Container pose:", pose_container_world[:3, 3])
+                    # print("True Container Pose:", env.get_container_pose()[:3, 3])
             
             if step == 0:
                 init_pose_container_world = pose_container_world.copy()
+                init_yaw = get_yaw_from_pose(pose_container_world)
+                target_yaw = -1 * init_yaw
 
-            quad_command = forward_quad_policy(pose_container_world, target_container_pose)
+            quad_command = forward_quad_policy(pose_container_world, target_container_pose, target_yaw)
             # print(quad_command)
             move_head = False
         
@@ -332,12 +478,19 @@ def main():
                 env.step_env(quad_command=quad_command)
             
             
-            if flag: break
+            if flag: 
+                quad_command = np.array([0,0,0])
+                env.step_env(quad_command=quad_command)
+                break
+            
+            if step == forward_steps - 1:
+                quad_command = np.array([0,0,0])
+                env.step_env(quad_command=quad_command)
 
     print("Quadruped moved to target position.")
     # --------------------------------------step 2: detect driller pose------------------------------------------------------
     
-    pose_est_ckpt_path = "pose_est/est_pose_PointNet_euler_geodesic_1e-3_64/checkpoint/checkpoint_20000.pth"  
+    pose_est_ckpt_path = "/home/iros/桌面/eai_hw4/pose_est/est_pose_PointNet_euler_geodesic_1e-3_64_generate_cut_06071059_adaptive_0.1/checkpoint/checkpoint_12500.pth"  
     pose_est_config = Pose_Est_Config.from_yaml(get_exp_config_from_checkpoint(pose_est_ckpt_path))
     pose_est_model = get_pose_est_model(pose_est_config)
     pose_est_checkpoint = torch.load(pose_est_ckpt_path, map_location="cpu")
@@ -348,13 +501,13 @@ def main():
         obs_wrist = env.get_obs(camera_id=1) # wrist camera
         rgb, depth, camera_pose = obs_wrist.rgb, obs_wrist.depth, obs_wrist.camera_pose
         wrist_camera_matrix = env.sim.humanoid_robot_cfg.camera_cfg[1].intrinsics
-        # driller_pose = detect_driller_pose(rgb, depth, wrist_camera_matrix, camera_pose, pose_est_model)
-        driller_pose = env.get_driller_pose()
+        driller_pose = detect_driller_pose(rgb, depth, wrist_camera_matrix, camera_pose, pose_est_model)
+        print(f"Driller Pose:\n{driller_pose}")
+        driller_pose_gt = env.get_driller_pose()
+        print(f"Ground Truth Driller Pose:\n{driller_pose_gt}")
         # metric judgement
         Metric['obj_pose'] = env.metric_obj_pose(driller_pose)
         
-    # print(Metric['obj_pose'], "Driller pose detected:", driller_pose)
-    
     # exit()
 
 
@@ -375,6 +528,7 @@ def main():
         for obj_frame_grasp in valid_grasps:
             trans=obj_pose[:3, :3] @ obj_frame_grasp.trans + obj_pose[:3, 3]
             rot=obj_pose[:3, :3] @ obj_frame_grasp.rot
+            rot=driller_pose_gt[:3, :3] @ obj_frame_grasp.rot
             rot_x = -1 if rot[0, 1] < 0 else 1
             rot_y = -1 if rot[1, 2] < 0 else 1
             rot_z = -1 if rot[2, 0] < 0 else 1
@@ -388,6 +542,7 @@ def main():
             rot = rot @ M
             
             trans[1] += 0.005
+            
             robot_frame_grasp = Grasp(
                 trans=trans,
                 rot=rot,
@@ -403,7 +558,7 @@ def main():
         reach_plan, lift_plan = grasp_plan
         
 
-        pregrasp_plan = plan_move_qpos(observing_qpos, reach_plan[0], steps=200) # pregrasp, change if you want
+        pregrasp_plan = plan_move_qpos(observing_qpos, reach_plan[0], steps=100) # pregrasp, change if you want
         execute_plan(env, pregrasp_plan)
         open_gripper(env)
         execute_plan(env, reach_plan)
@@ -421,32 +576,63 @@ def main():
         begin_trans, begin_rot = env.humanoid_robot_model.fk_eef(begin_qpos)
 
         end_trans = pose_container_world[:3, 3].copy()
-        end_trans[2] += 0.2  # 抬高避免碰撞
-        end_trans[0] += 0.45  
-        end_trans[1] += 0.1  # 偏移一点，避免碰撞
-        end_rot = begin_rot.copy()
+        end_trans[2] += 0.25
+        end_trans[1] -= 0.07
+        # print(f"True Trans: {env.get_container_pose()[:3, 3]}")
+        # print(f"End Trans: {end_trans}")
+        # print(f"Begin Trans: {begin_trans}")
 
         # 高点
-        middle_trans = end_trans.copy()
-        middle_trans[2] += 0.3  # 抬高 15cm
-        middle_rot = end_rot  # 姿态不变
+        middle_trans = (end_trans + begin_trans) / 2
+        middle_trans[2] += 0.3
+        middle_rot = np.array([
+                [ 0, -1,  0],
+                [ 0,  0,  1],
+                [-1,  0,  0]
+            ])
+        
+        trans_1 = (middle_trans + begin_trans) / 2
+        rot_1 = middle_rot.copy()  # 姿态不变
+        trans_2 = (middle_trans + end_trans) / 2
+        rot_2 = middle_rot.copy()  # 姿态不变
+        
+        end_rot = middle_rot.copy()
 
         # 第一段：从抓完处 → 高点
-        plan1 = plan_move(env, begin_qpos, begin_trans, begin_rot, middle_trans, middle_rot, steps=50)
+        plan1 = plan_move(env, begin_qpos, begin_trans, begin_rot, trans_1, rot_1, steps=50)
         if plan1 is None:
-            print("Plan to middle failed")
+            print("Plan to 1 failed")
             return
         
         execute_plan(env, plan1)
+        
+        qpos_1 = plan1[-1]
+        plan_middle = plan_move(env, qpos_1, trans_1, rot_1, middle_trans, middle_rot, steps=50)
+        if plan_middle is None:
+            print("Plan to middle failed")
+            return
+        
+        execute_plan(env, plan_middle)
+        time.sleep(0.1)
 
         # 第二段：从高点 → container 上方
-        qpos_middle = plan1[-1]
-        plan2 = plan_move(env, qpos_middle, middle_trans, middle_rot, end_trans, end_rot, steps=50)
+        qpos_middle = plan_middle[-1]
+        plan2 = plan_move(env, qpos_middle, middle_trans, middle_rot, trans_2, rot_2, steps=100)
         if plan2 is None:
-            print("Plan to container failed")
+            print("Plan to 2 failed")
             return
         
         execute_plan(env, plan2)
+        time.sleep(0.1)
+        
+        qpos_2 = plan2[-1]
+        plan_end = plan_move(env, qpos_2, trans_2, rot_2, end_trans, end_rot, steps=100)
+        if plan_end is None:
+            print("Plan to container failed")
+            return
+        
+        execute_plan(env, plan_end)
+        time.sleep(0.5)
         open_gripper(env)
 
 
@@ -454,7 +640,7 @@ def main():
     if not DISABLE_MOVE:
         # implement
         #
-        backward_steps = 1000 # customize by yourselves
+        backward_steps = 10000 # customize by yourselves
         for step in range(backward_steps):
             # same as before, please implement this
             #
@@ -473,10 +659,14 @@ def main():
                     trans_container_world = rot_marker_world @ np.array([0,0.31,0.02]) + trans_marker_world
                     rot_container_world = rot_marker_world
                     pose_container_world = to_pose(trans_container_world, rot_container_world)
+                    pose_container_world[0, 3] -= 0.6 if get_yaw_from_pose(pose_container_world) > 0 else 0
                 
                     # print("Container pose:", pose_container_world)
+                    # print("Target container pose:", init_pose_container_world[:3, 3])
+                    # print("Detected Container pose:", pose_container_world[:3, 3])
+                    # print("True Container Pose:", env.get_container_pose()[:3, 3])
 
-            quad_command = backward_quad_policy(pose_container_world, init_pose_container_world)
+            quad_command = backward_quad_policy(pose_container_world, init_pose_container_world, init_yaw)
             move_head = False
         
             flag, error = is_close(pose_container_world, init_pose_container_world, threshold=0.01)
